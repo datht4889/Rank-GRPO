@@ -12,6 +12,7 @@
 #             from the read-only INPUT_ROOT (default /kaggle/input/datasets/datoggg/rankgrpo_data, folders or
 #             zip files with any names), otherwise downloaded from Google Drive
 #   eval      test-set eval of zero-shot / released SFT / released Rank-GRPO, compared with paper Table 1
+#   noise     responder-noise diagnostic of the SFT policy (checks the ReMaRk claim; scripts/responder_noise.py)
 #   sft       SFT from the base model (paper: checkpoint-1500 of a 10-epoch cosine run), time-budgeted
 #   eval_sft  test-set eval of the own SFT checkpoint
 #   rl        Rank-GRPO from the SFT checkpoint (own one if `sft` ran, else the released one), time-budgeted
@@ -464,6 +465,13 @@ if h:
 EOF
 }
 
+stage_noise() {  # responder-noise diagnostic (ReMaRk claim) on the SFT policy: 500 requests x 8 lists
+  activate; detect_gpus
+  local init=${RL_INIT:-$SFT_RELEASED}
+  run_logged logs/responder_noise.txt 0 python scripts/responder_noise.py --model "$init" --dtype "$VLLM_DTYPE"     --n_requests "${NOISE_REQUESTS:-500}" --out "$OUT/responder_noise"
+  cp logs/responder_noise.txt "$OUT/" 2>/dev/null || true
+}
+
 stage_eval_rl() {
   activate; detect_gpus
   local ck; ck=$(latest_ckpt "$RL_OWN_DIR")
@@ -476,7 +484,7 @@ main() {
   (( ${#stages[@]} )) || read -r -a stages <<< "$DEFAULT_STAGES"
   local s
   for s in "${stages[@]}"; do
-    case "$s" in setup|data|eval|sft|eval_sft|rl|eval_rl) ;; *) die "unknown stage '$s'" ;; esac
+    case "$s" in setup|data|eval|noise|sft|eval_sft|rl|eval_rl) ;; *) die "unknown stage '$s'" ;; esac
   done
   log "stages: ${stages[*]} | WORK=$WORK | OUT=$OUT"
   for s in "${stages[@]}"; do
