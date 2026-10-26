@@ -67,6 +67,7 @@ TRAIN_OPTIM="${TRAIN_OPTIM:-paged_adamw_8bit}"  # HF optimizer; with DS_OFFLOAD_
 EVAL_MEM="${EVAL_MEM:-0.85}"                  # vLLM GPU memory fraction for evaluation
 
 REWARD="${REWARD:-exp_inf}"                   # exp_inf = Rank-GRPO (exp), log_decay = Rank-GRPO (log)
+RL_TRAIN_SET="${RL_TRAIN_SET:-rows}"          # rows = Rank-GRPO (one row per responder) | union = ReMaRk (one row per request, union of all responders' items)
 RL_INIT="${RL_INIT:-}"                        # SFT checkpoint to start RL from (default: own SFT if any, else released)
 RL_HOURS="${RL_HOURS:-4}"                     # wall-clock budget of the rl stage (0 = no limit)
 RL_MAX_STEPS="${RL_MAX_STEPS:--1}"            # -1 = 2 epochs as in the paper (15,958 steps)
@@ -95,7 +96,7 @@ VENV="$WORK/venv"
 SFT_RELEASED="results/Qwen/Qwen2.5-0.5B-Instruct/checkpoint-1500"
 RL_RELEASED="results/grpo/Qwen/Qwen2.5-0.5B-Instruct_lr1e-06_kl0.001/checkpoint-15800"
 SFT_OWN_DIR="results/own/sft"
-RL_OWN_DIR="results/own/rank_grpo_${REWARD}"
+RL_OWN_DIR="results/own/rank_grpo_${REWARD}_${RL_TRAIN_SET}"
 
 export WANDB_MODE="${WANDB_MODE:-offline}"
 export WANDB_DIR="${WANDB_DIR:-$WORK}"
@@ -435,10 +436,17 @@ stage_rl() {
   (( RL_BATCH % 8 == 0 )) || die "RL_BATCH must be a multiple of the 8 generations per prompt"
   write_accel_cfg "$WORK/accel_rl.yaml" "$ga"
   export RANK_GRPO_VLLM_DTYPE="$VLLM_DTYPE"
-  log "Rank-GRPO ($REWARD) from $init: $NGPU GPU x $RL_PER_DEVICE x grad-accum $ga = $RL_BATCH completions/step, budget ${RL_HOURS} h"
+  local train_path=processed_datasets/grpo/grpo_dataset
+  if [[ "$RL_TRAIN_SET" == union ]]; then
+    train_path=processed_datasets/grpo/grpo_union
+    [[ -f "$train_path/train/state.json" ]] || python scripts/build_union_dataset.py --dst "$train_path/train"
+  elif [[ "$RL_TRAIN_SET" != rows ]]; then
+    die "RL_TRAIN_SET must be rows or union"
+  fi
+  log "Rank-GRPO ($REWARD, train set: $RL_TRAIN_SET) from $init: $NGPU GPU x $RL_PER_DEVICE x grad-accum $ga = $RL_BATCH completions/step, budget ${RL_HOURS} h"
   run_logged "logs/train_rank_grpo_${REWARD}.txt" "$RL_HOURS" \
     accelerate launch --config_file "$WORK/accel_rl.yaml" train_rank_grpo.py \
-      --train_path processed_datasets/grpo/grpo_dataset --model_name "$MODEL" --sft_model_path "$init" \
+      --train_path "$train_path" --model_name "$MODEL" --sft_model_path "$init" \
       --catalog_path reddit_catalog/gt_catalog.pkl --reward_func "$REWARD" --output_dir "$RL_OWN_DIR" \
       --mu 1 --lr 1e-6 --kl_beta 1e-3 --adam_beta1 0.9 --adam_beta2 0.99 --optim "$TRAIN_OPTIM" \
       --num_train_epochs 2 --max_steps "$RL_MAX_STEPS" \
@@ -476,7 +484,7 @@ stage_eval_rl() {
   activate; detect_gpus
   local ck; ck=$(latest_ckpt "$RL_OWN_DIR")
   [[ -n "$ck" ]] || die "no own Rank-GRPO checkpoint in $RL_OWN_DIR (run the 'rl' stage)"
-  eval_models "own_rank_grpo_${REWARD}_$(basename "$ck")=$ck"
+  eval_models "own_rank_grpo_${REWARD}_${RL_TRAIN_SET}_$(basename "$ck")=$ck"
 }
 
 main() {
