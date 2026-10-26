@@ -59,7 +59,10 @@ MODEL="Qwen/Qwen2.5-0.5B-Instruct"
 
 PRECISION="${PRECISION:-auto}"                # auto (bf16 if supported, else fp16) | bf16 | fp16 | fp32
 VLLM_DTYPE="${VLLM_DTYPE:-}"                  # empty = auto (half on GPUs without bf16, e.g. T4)
-DS_OFFLOAD_PARAM="${DS_OFFLOAD_PARAM:-none}"  # DeepSpeed ZeRO-3 param offload: none | cpu (optimizer is always on CPU)
+DS_ZERO="${DS_ZERO:-3}"                       # DeepSpeed ZeRO stage: 3 (authors) | 2 (faster for a 0.5B model)
+DS_OFFLOAD_OPT="${DS_OFFLOAD_OPT:-cpu}"       # optimizer offload: cpu (authors; accelerate swaps in DeepSpeed CPU Adam) | none
+DS_OFFLOAD_PARAM="${DS_OFFLOAD_PARAM:-none}"  # ZeRO-3 param offload: none | cpu
+TRAIN_OPTIM="${TRAIN_OPTIM:-paged_adamw_8bit}"  # HF optimizer; with DS_OFFLOAD_OPT=cpu it is replaced by CPU Adam anyway
 EVAL_MEM="${EVAL_MEM:-0.85}"                  # vLLM GPU memory fraction for evaluation
 
 REWARD="${REWARD:-exp_inf}"                   # exp_inf = Rank-GRPO (exp), log_decay = Rank-GRPO (log)
@@ -149,11 +152,11 @@ compute_environment: LOCAL_MACHINE
 debug: false
 deepspeed_config:
   gradient_accumulation_steps: $2
-  offload_optimizer_device: cpu
-  offload_param_device: $DS_OFFLOAD_PARAM
+  offload_optimizer_device: $DS_OFFLOAD_OPT
+  offload_param_device: $( [[ "$DS_ZERO" == 3 ]] && echo "$DS_OFFLOAD_PARAM" || echo none )
   zero3_init_flag: false
   zero3_save_16bit_model: true
-  zero_stage: 3
+  zero_stage: $DS_ZERO
 distributed_type: DEEPSPEED
 downcast_bf16: 'no'
 enable_cpu_affinity: false
@@ -401,7 +404,7 @@ stage_sft() {
   run_logged logs/train_sft.txt "$SFT_HOURS" \
     accelerate launch --config_file "$WORK/accel_sft.yaml" train_sft.py \
       --dataset_path processed_datasets/sft_dataset --model_name "$MODEL" --output_dir "$SFT_OWN_DIR" \
-      --learning_rate 5e-5 --warmup_ratio 0.05 --lr_scheduler_type cosine --optim paged_adamw_8bit \
+      --learning_rate 5e-5 --warmup_ratio 0.05 --lr_scheduler_type cosine --optim "$TRAIN_OPTIM" \
       --num_train_epochs 10 --stop_at_step "$SFT_STOP_STEP" --max_length 1024 \
       --per_device_train_batch_size "$SFT_PER_DEVICE" --per_device_eval_batch_size "$SFT_PER_DEVICE" \
       --gradient_accumulation_steps "$ga" --gradient_checkpointing "${PREC_FLAG[@]}" \
@@ -436,7 +439,7 @@ stage_rl() {
     accelerate launch --config_file "$WORK/accel_rl.yaml" train_rank_grpo.py \
       --train_path processed_datasets/grpo/grpo_dataset --model_name "$MODEL" --sft_model_path "$init" \
       --catalog_path reddit_catalog/gt_catalog.pkl --reward_func "$REWARD" --output_dir "$RL_OWN_DIR" \
-      --mu 1 --lr 1e-6 --kl_beta 1e-3 --adam_beta1 0.9 --adam_beta2 0.99 --optim paged_adamw_8bit \
+      --mu 1 --lr 1e-6 --kl_beta 1e-3 --adam_beta1 0.9 --adam_beta2 0.99 --optim "$TRAIN_OPTIM" \
       --num_train_epochs 2 --max_steps "$RL_MAX_STEPS" \
       --per_device_train_batch_size "$RL_PER_DEVICE" --per_device_eval_batch_size "$RL_PER_DEVICE" \
       --gradient_accumulation_steps "$ga" --num_generations 8 \
