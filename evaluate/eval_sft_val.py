@@ -12,12 +12,12 @@ from vllm import LLM, SamplingParams
 from datasets import load_from_disk
 
 # Local libs
-from libs.analyze import find_latest_checkpoint, parse_log_history, plot_losses
+from libs.analyze import find_latest_checkpoint, list_checkpoint_steps, parse_log_history, plot_losses
 from libs.save_eval_state import save_analysis_state
 from libs.log_wandb import merge_and_upload
 
-# loading from the global libs for evaluation
-sys.path.insert(0, "../../libs")
+# loading from the global libs for evaluation (<repo>/libs, independent of the working directory)
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "libs"))
 from utils import process_rec_raw
 from metrics import evaluate_direct_match_truncate
 
@@ -31,6 +31,7 @@ def parse_args():
     parser.add_argument("--wandb_project", default="sft_eval_val", help="Weights & Biases project name.")
     parser.add_argument("--use_multiprocessing", action="store_true", help="Use multiprocessing for evaluation.")
     parser.add_argument("--upload_wandb", action="store_true", help="Upload results to Weights & Biases.")
+    parser.add_argument("--dtype", default="auto", help="vLLM dtype; use 'half' on GPUs without bf16 support (T4/V100).")
     return parser.parse_args()
 
 
@@ -65,8 +66,8 @@ def main():
     train_steps, train_losses, eval_steps, eval_losses = parse_log_history(trainer_state_path)
     plot_losses(train_steps, train_losses, eval_steps, eval_losses, args.model_name, args.output_dir)
 
-    last_step = int(latest_checkpoint_path.split("-")[-1])
-    step_list = list(range(0, last_step, 200))
+    # step 0 = zero-shot base model, then every saved checkpoint (every 200 steps, plus the latest)
+    step_list = list_checkpoint_steps(model_root, step_interval=200)
     llm_outputs = {}
     test_data_with_rec = [item for item in val_dataset]
 
@@ -82,7 +83,8 @@ def main():
         llm = LLM(model=model_to_load,
                   tensor_parallel_size=1,
                   gpu_memory_utilization=0.8,
-                  max_model_len=8192)
+                  max_model_len=8192,
+                  dtype=args.dtype)
         sampling_params = SamplingParams(temperature=0, top_p=0.9, max_tokens=1024)
         llm_outputs[step] = llm.chat(all_input_texts, sampling_params)
         del llm

@@ -1,0 +1,26 @@
+# Rank-GRPO, Qwen2.5-0.5B, 4 GPUs: settings recovered from the released checkpoint-15800/training_args.bin
+# (per_device_train_batch_size=32 x gradient_accumulation_steps=3 x 4 GPUs = 384 completions = 48 prompts x 8 generations per step).
+# gradient_accumulation_steps here MUST equal --gradient_accumulation_steps passed to train_rank_grpo.py.
+compute_environment: LOCAL_MACHINE
+debug: false
+deepspeed_config:
+  gradient_accumulation_steps: 3
+  offload_optimizer_device: cpu
+  offload_param_device: cpu
+  zero3_init_flag: false
+  zero3_save_16bit_model: true
+  zero_stage: 3
+distributed_type: DEEPSPEED
+downcast_bf16: 'no'
+enable_cpu_affinity: false
+machine_rank: 0
+main_training_function: main
+mixed_precision: bf16
+num_machines: 1
+num_processes: 4
+rdzv_backend: static
+same_network: true
+tpu_env: []
+tpu_use_cluster: false
+tpu_use_sudo: false
+use_cpu: false

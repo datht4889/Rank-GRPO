@@ -905,6 +905,8 @@ class RankGRPOTrainer(Trainer):
                     # Latest vLLM v1 memory profiler is misled by the high default value (i.e., 32768) - thinking there's not enough memory
                     max_num_batched_tokens=4096,
                     model_impl=self.args.vllm_model_impl,
+                    # e.g. "half" on GPUs without bf16 support (T4/V100); "auto" keeps the checkpoint dtype
+                    dtype=os.environ.get("RANK_GRPO_VLLM_DTYPE", "auto"),
                 )
 
             # vLLM specific sampling arguments

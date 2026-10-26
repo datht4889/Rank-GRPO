@@ -1,13 +1,22 @@
 import os
-import sys
 import argparse
 from datasets import load_from_disk
 from accelerate import Accelerator
+from transformers import TrainerCallback
 from trl import SFTConfig, SFTTrainer
 
-sys.path.append("libs")
-from utils import process_rec_raw
-from metrics import evaluate_direct_match_truncate
+
+class StopAtStepCallback(TrainerCallback):
+    """Save and stop at a given step while keeping the LR schedule of the full run
+    (the paper continues RL from checkpoint-1500 of a 10-epoch cosine schedule)."""
+    def __init__(self, stop_at_step):
+        self.stop_at_step = stop_at_step
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step >= self.stop_at_step:
+            control.should_save = True
+            control.should_training_stop = True
+        return control
 
 
 def parse_args():
@@ -45,10 +54,16 @@ def parse_args():
     sched.add_argument("--gradient_accumulation_steps", type=int, default=8, help="Number of gradient accumulation steps.")
     sched.add_argument("--dataset_num_proc", type=int, default=64, help="Number of processes for dataset preprocessing.")
     sched.add_argument("--max_length", type=int, default=1024, help="Maximum input sequence length.")
+    sched.add_argument("--max_steps", type=int, default=-1, help="Stop after N optimizer steps (-1 = use num_train_epochs).")
+    sched.add_argument("--stop_at_step", type=int, default=None, help="Save and stop at this step without shortening the LR schedule.")
+    sched.add_argument("--num_train_samples", type=int, default=None, help="Use only the first N rows of the train and validation splits (for smoke tests).")
 
     log = parser.add_argument_group("Checkpointing / logging")
+    log.add_argument("--output_dir", default=None, help="Output directory. Defaults to ./results/{model_name}.")
     log.add_argument("--save_strategy", default="steps", help="Save strategy for checkpoints.")
     log.add_argument("--save_steps", type=int, default=50, help="Number of steps between checkpoints.")
+    log.add_argument("--save_total_limit", type=int, default=None, help="Keep at most N checkpoints.")
+    log.add_argument("--save_only_model", action="store_true", help="Save model weights only (no optimizer state, cannot resume).")
     log.add_argument("--logging_steps", type=int, default=10, help="Number of steps between log outputs.")
     log.add_argument("--eval_strategy", default="steps", help="Evaluation strategy (steps or epoch).")
     log.add_argument("--eval_steps", type=int, default=10, help="Number of steps between evaluations.")
@@ -57,6 +72,7 @@ def parse_args():
     misc = parser.add_argument_group("Miscellaneous")
     misc.add_argument("--seed", type=int, default=3407, help="Random seed for reproducibility.")
     misc.add_argument("--bf16", action="store_true", help="Enable bfloat16 precision training.")
+    misc.add_argument("--fp16", action="store_true", help="Enable float16 mixed precision (GPUs without bf16, e.g. T4).")
     misc.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing.")
 
     return parser.parse_args()
@@ -71,19 +87,26 @@ def main():
     accelerator.print(f"📚 Loading datasets from {args.dataset_path}")
     train_dataset = load_from_disk(os.path.join(args.dataset_path, "train"))
     val_dataset = load_from_disk(os.path.join(args.dataset_path, "validation"))
+    if args.num_train_samples is not None:
+        train_dataset = train_dataset.select(range(min(args.num_train_samples, len(train_dataset))))
+        val_dataset = val_dataset.select(range(min(args.num_train_samples, len(val_dataset))))
 
     # SFT configuration
     config = SFTConfig(
-        output_dir=f"./results/{args.model_name}",
+        output_dir=args.output_dir or f"./results/{args.model_name}",
         per_device_train_batch_size=args.per_device_train_batch_size,
         per_device_eval_batch_size=args.per_device_eval_batch_size,
         num_train_epochs=args.num_train_epochs,
+        max_steps=args.max_steps,
         eval_strategy=args.eval_strategy,
         eval_steps=args.eval_steps,
         save_strategy=args.save_strategy,
         save_steps=args.save_steps,
+        save_total_limit=args.save_total_limit,
+        save_only_model=args.save_only_model,
         logging_steps=args.logging_steps,
         bf16=args.bf16,
+        fp16=args.fp16,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         warmup_ratio=args.warmup_ratio,
         learning_rate=args.learning_rate,
@@ -101,6 +124,7 @@ def main():
         args=config,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
+        callbacks=[StopAtStepCallback(args.stop_at_step)] if args.stop_at_step else None,
     )
 
     accelerator.print("🚀 Training …")

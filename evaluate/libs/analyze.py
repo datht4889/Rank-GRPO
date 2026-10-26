@@ -30,7 +30,24 @@ def find_latest_checkpoint(model_dir: str) -> str:
         print(f"Error: Could not determine the latest checkpoint in {model_dir}")
         return None
 
-    
+
+def list_checkpoint_steps(model_dir: str, step_interval: int = 200) -> list:
+    """
+    Steps to evaluate: 0 (the initial model) plus every checkpoint-N that exists on disk with
+    N % step_interval == 0. The latest checkpoint is always included, so this also works when
+    only the final checkpoint is available (e.g. the released checkpoints).
+    """
+    steps = sorted(
+        int(m.group(1))
+        for d in os.listdir(model_dir)
+        if (m := re.fullmatch(r"checkpoint-(\d+)", d)) and os.path.isdir(os.path.join(model_dir, d))
+    )
+    keep = [s for s in steps if step_interval <= 0 or s % step_interval == 0]
+    if steps and steps[-1] not in keep:
+        keep.append(steps[-1])
+    return [0] + keep
+
+
 def parse_log_history(trainer_state_path: str) -> tuple:
     try:
         with open(trainer_state_path, 'r') as f:

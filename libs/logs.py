@@ -1,7 +1,6 @@
 import os, hashlib, wandb
 from datetime import datetime
 from accelerate import Accelerator
-from libs.logs import _stable_wandb_run_id
 
 def _stable_wandb_run_id(output_dir, model_name, checkpoint, seed):
     """

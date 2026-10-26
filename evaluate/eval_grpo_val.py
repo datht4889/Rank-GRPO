@@ -10,12 +10,13 @@ from vllm import LLM, SamplingParams
 from datasets import load_from_disk
 
 # --- GRPO-specific analysis utilities ---
-from libs.analyze_grpo import find_latest_checkpoint, parse_log_history, plot_losses
+from libs.analyze import list_checkpoint_steps
+from libs.analyze_grpo import find_latest_checkpoint, parse_grpo_log_history, plot_rewards
 from libs.save_eval_state import save_analysis_state
 from libs.log_wandb import merge_and_upload
 
-# --- global libs for evaluation ---
-sys.path.insert(0, "../../libs")
+# --- global libs for evaluation (<repo>/libs, independent of the working directory) ---
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "libs"))
 from utils import process_rec_raw
 from metrics import evaluate_direct_match_truncate
 
@@ -28,6 +29,9 @@ def parse_args():
                         help="Base model or checkpoint name.")
     parser.add_argument("--model_root", required=True,
                         help="Path to the GRPO training results directory containing checkpoints.")
+    parser.add_argument("--init_model", default=None,
+                        help="Model evaluated as step 0, normally the SFT checkpoint RL started from "
+                             "(defaults to --model_name, i.e. the zero-shot base model).")
     parser.add_argument("--dataset_path", default="../processed_datasets/sft_dataset",
                         help="Validation dataset path (load_from_disk).") # validation and test data are stored in sft folder
     parser.add_argument("--catalog_path", default="../processed_datasets/gt_catalog.pkl",
@@ -41,6 +45,8 @@ def parse_args():
                         help="Maximum generation length for vLLM inference.")
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.8,
                         help="Fraction of GPU memory to allocate for vLLM.")
+    parser.add_argument("--dtype", default="auto",
+                        help="vLLM dtype; use 'half' on GPUs without bf16 support (T4/V100).")
     parser.add_argument("--tensor_parallel_size", type=int, default=1,
                         help="Number of tensor-parallel GPUs for vLLM.")
     parser.add_argument("--step_interval", type=int, default=200,
@@ -74,12 +80,12 @@ def main():
     trainer_state_path = os.path.join(latest_ckpt, "trainer_state.json")
 
     print("Parsing GRPO training log history ...")
-    train_steps, train_rewards, eval_steps, eval_rewards = parse_log_history(trainer_state_path)
-    plot_losses(train_steps, train_rewards, eval_steps, eval_rewards,
-                args.model_name, args.output_dir)
+    steps, rewards, reward_stds = parse_grpo_log_history(trainer_state_path)
+    os.makedirs(args.output_dir, exist_ok=True)
+    plot_rewards(steps, rewards, reward_stds, args.model_name, args.output_dir)
 
-    last_step = int(latest_ckpt.split("-")[-1])
-    step_list = list(range(0, last_step + args.step_interval, args.step_interval))
+    # step 0 = init model, then every saved checkpoint (every step_interval steps, plus the latest)
+    step_list = list_checkpoint_steps(model_root, step_interval=args.step_interval)
     llm_outputs = {}
     test_data_with_rec = [item for item in val_dataset]
 
@@ -91,13 +97,14 @@ def main():
         if step in llm_outputs:
             continue
         print(f"Processing checkpoint {step} ...")
-        model_to_load = args.model_name if step == 0 else model_path_tmpl.format(step)
+        model_to_load = (args.init_model or args.model_name) if step == 0 else model_path_tmpl.format(step)
 
         llm = LLM(
             model=model_to_load,
             tensor_parallel_size=args.tensor_parallel_size,
             gpu_memory_utilization=args.gpu_memory_utilization,
             max_model_len=8192,
+            dtype=args.dtype,
         )
         sampling_params = SamplingParams(
             temperature=0, top_p=0.9, max_tokens=args.max_tokens

@@ -54,3 +54,16 @@ def evaluate_direct_match(item, k, seen_field, rec_field, gt_field, gt_catalog):
     recall = recall_at_k(hits, num_gt, k)
     ndcg = ndcg_at_k(hits, num_gt, k)
     return recall, ndcg
+
+def evaluate_direct_match_truncate(item, k, seen_field, rec_field, gt_field, gt_catalog, rec_num=20):
+    """
+    Same as `evaluate_direct_match`, but only the first `rec_num` generated items are kept
+    before removing seen / out-of-catalog items, so a model that emits more than `rec_num`
+    items gains no extra slots in the top-k.
+
+    NOTE: this function is imported by the evaluation scripts but was missing from the
+    released code; this is a reconstruction, not the authors' original implementation.
+    """
+    item = dict(item)
+    item[rec_field] = item[rec_field][:rec_num]
+    return evaluate_direct_match(item, k, seen_field, rec_field, gt_field, gt_catalog)

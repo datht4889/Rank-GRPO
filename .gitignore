@@ -1,0 +1,15 @@
+# Downloaded data / checkpoints and generated outputs (large, never commit)
+processed_datasets/
+processed_datasets.zip
+downloads/
+results/
+results_eval/
+results_grpo_test/
+figs/
+logs/
+wandb/
+
+# Environments / caches
+.venv/
+__pycache__/
+*.pyc

@@ -1,0 +1,3 @@
+# Shell scripts are run from Linux / WSL even when the repo is checked out on Windows: keep LF endings.
+*.sh text eol=lf
+*.SH text eol=lf

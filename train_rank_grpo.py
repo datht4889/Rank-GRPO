@@ -51,8 +51,13 @@ def parse_args():
         ),
     )
     core.add_argument(
+        "--sft_model_path",
+        default=None,
+        help="Explicit path to the SFT checkpoint. Defaults to ./results/{model_name}/checkpoint-{sft_checkpoint}.",
+    )
+    core.add_argument(
         "--catalog_path",
-        default="gt_catalog.pkl",
+        default="reddit_catalog/gt_catalog.pkl",
         help="Path to the ground-truth catalog pickle (used for hit/match validation).",
     )
 
@@ -69,6 +74,8 @@ def parse_args():
     sched.add_argument("--per_device_eval_batch_size", type=int, default=8, help="Evaluation batch size per GPU.")
     sched.add_argument("--num_train_epochs", type=int, default=2, help="Number of training epochs.")
     sched.add_argument("--mu", type=int, default=1, help="Number of GRPO iterations (μ=1 = strictly on-policy).")
+    sched.add_argument("--max_steps", type=int, default=-1, help="Stop after N optimizer steps (-1 = use num_train_epochs).")
+    sched.add_argument("--num_train_samples", type=int, default=None, help="Use only the first N training rows (for smoke tests).")
 
     gen = parser.add_argument_group("Model / generation parameters")
     gen.add_argument("--max_prompt_length", type=int, default=2048, help="Maximum prompt token length.")
@@ -90,15 +97,19 @@ def parse_args():
     vllm.add_argument("--vllm_tensor_parallel_size", type=int, default=4, help="vLLM tensor parallel size.")
 
     log = parser.add_argument_group("Logging / checkpointing")
+    log.add_argument("--output_dir", default=None, help="Output directory. Defaults to ./results/grpo/{model_name}_lr{lr}_kl{kl_beta}_mu{mu}.")
     log.add_argument("--wandb_project", default="rank_grpo", help="Weights & Biases project name.")
     log.add_argument("--logging_steps", type=int, default=10, help="Logging frequency in steps.")
     log.add_argument("--save_strategy", default="steps", help="Checkpoint save strategy: steps or epoch.")
     log.add_argument("--save_steps", type=int, default=200, help="Save model every N steps.")
+    log.add_argument("--save_total_limit", type=int, default=None, help="Keep at most N checkpoints.")
+    log.add_argument("--save_only_model", action="store_true", help="Save model weights only (no optimizer state, cannot resume).")
     log.add_argument("--resume", action="store_true", help="Resume training from the latest checkpoint.")
 
     misc = parser.add_argument_group("Miscellaneous")
     misc.add_argument("--seed", type=int, default=3407, help="Random seed for reproducibility.")
     misc.add_argument("--bf16", action="store_true", help="Enable bfloat16 precision.")
+    misc.add_argument("--fp16", action="store_true", help="Enable float16 mixed precision (GPUs without bf16, e.g. T4).")
     misc.add_argument("--verbose", action="store_true", help="Enable verbose LR scheduler output.")
 
     return parser.parse_args()
@@ -111,6 +122,8 @@ def main():
     # Load datasets and catalog
     gt_catalog = load_catalog(args.catalog_path)
     train_dataset = load_from_disk(os.path.join(args.train_path, "train"))
+    if args.num_train_samples is not None:
+        train_dataset = train_dataset.select(range(min(args.num_train_samples, len(train_dataset))))
 
     # Reward function selection
     if args.reward_func == "exp_inf":
@@ -121,8 +134,8 @@ def main():
         raise ValueError(f"{args.reward_func} not implemented!")
 
     # Define model paths and W&B run
-    sft_model_path = f"./results/{args.model_name}/checkpoint-{args.sft_checkpoint}"
-    output_dir = f"./results/grpo/{args.model_name}_lr{args.lr}_kl{args.kl_beta}_mu{args.mu}"
+    sft_model_path = args.sft_model_path or f"./results/{args.model_name}/checkpoint-{args.sft_checkpoint}"
+    output_dir = args.output_dir or f"./results/grpo/{args.model_name}_lr{args.lr}_kl{args.kl_beta}_mu{args.mu}"
     run_name = setup_wandb(accelerator, output_dir, args.model_name, args.sft_checkpoint, args.seed, args.wandb_project)
 
     # ---------------- Learning rate scheduler ----------------
@@ -145,11 +158,15 @@ def main():
         per_device_train_batch_size=args.per_device_train_batch_size,
         per_device_eval_batch_size=args.per_device_eval_batch_size,
         num_train_epochs=args.num_train_epochs,
+        max_steps=args.max_steps,
         num_iterations=args.mu,
         save_strategy=args.save_strategy,
         save_steps=args.save_steps,
+        save_total_limit=args.save_total_limit,
+        save_only_model=args.save_only_model,
         logging_steps=args.logging_steps,
         bf16=args.bf16,
+        fp16=args.fp16,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         learning_rate=args.lr,
         optim=args.optim,

@@ -10,6 +10,7 @@ Evaluates a GRPO-aligned model on the test set:
 """
 
 import os
+import re
 import sys
 import json
 import pickle
@@ -21,12 +22,11 @@ from vllm import LLM, SamplingParams
 from datasets import load_from_disk
 
 # --- GRPO-specific analysis utilities ---
-from libs.analyze_grpo import find_latest_checkpoint, parse_log_history, plot_losses
+from libs.analyze_grpo import find_latest_checkpoint
 from libs.save_eval_state import save_analysis_state
-from libs.log_wandb import merge_and_upload
 
-# --- global libs for evaluation ---
-sys.path.insert(0, "../../libs")
+# --- global libs for evaluation (<repo>/libs, independent of the working directory) ---
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "libs"))
 from utils import process_rec_raw
 from metrics import evaluate_direct_match_truncate
 
@@ -36,13 +36,17 @@ def parse_args():
         description="Evaluate GRPO-aligned models on test set using vLLM inference."
     )
     parser.add_argument("--model_name", required=True, help="Base model or checkpoint name.")
-    parser.add_argument("--model_root", required=True, help="Path to the GRPO training directory.")
+    parser.add_argument("--model_root", default=None, help="Path to the GRPO training directory.")
+    parser.add_argument("--model_path", default=None,
+                        help="Evaluate this model directly (HF id or local dir), e.g. the zero-shot base model. "
+                             "Overrides --model_root/--checkpoint.")
     parser.add_argument("--dataset_path", required=True, help="Dataset directory (load_from_disk).")
     parser.add_argument("--catalog_path", required=True, help="Ground-truth catalog pickle path.")
     parser.add_argument("--checkpoint", type=int, default=None, help="Checkpoint step to evaluate (default = latest).")
     parser.add_argument("--max_tokens", type=int, default=1024, help="Maximum generation length.")
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.8, help="GPU memory fraction for vLLM.")
     parser.add_argument("--tensor_parallel_size", type=int, default=1, help="Tensor parallelism size.")
+    parser.add_argument("--dtype", default="auto", help="vLLM dtype; use 'half' on GPUs without bf16 support (T4/V100).")
     parser.add_argument("--save_dir", default="results_grpo_test", help="Output directory for results.")
     return parser.parse_args()
 
@@ -68,7 +72,11 @@ def main():
     print(f"Catalog size: {len(gt_catalog)}")
 
     # ---------- Determine Checkpoint ----------
-    if args.checkpoint is not None:
+    if args.model_path is not None:
+        ckpt_path = args.model_path
+    elif args.model_root is None:
+        raise ValueError("Pass either --model_path or --model_root.")
+    elif args.checkpoint is not None:
         ckpt_path = os.path.join(args.model_root, f"checkpoint-{args.checkpoint}")
     else:
         ckpt_path = find_latest_checkpoint(args.model_root)
@@ -82,6 +90,7 @@ def main():
         tensor_parallel_size=args.tensor_parallel_size,
         gpu_memory_utilization=args.gpu_memory_utilization,
         max_model_len=8192,
+        dtype=args.dtype,
     )
     print("✅ Model loaded successfully.")
 
@@ -138,7 +147,10 @@ def main():
     output_pkl = os.path.join(args.save_dir, f"{args.model_name.replace('/', '_')}_test.pkl")
     with open(output_pkl, "wb") as f:
         pickle.dump(test_data_with_rec, f)
-    save_analysis_state(args.save_dir, [], {args.model_name: (avg_recalls, avg_ndcgs)})
+    # save_analysis_state keys results by integer training step (0 = model loaded via --model_path)
+    step_match = re.search(r"checkpoint-(\d+)", ckpt_path)
+    step = int(step_match.group(1)) if step_match else 0
+    save_analysis_state(args.save_dir, [], {step: (avg_recalls, avg_ndcgs)})
 
     print(f"\n🎯 Evaluation complete for {args.model_name}")
     print(f"Results saved in: {args.save_dir}")
