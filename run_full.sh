@@ -346,17 +346,25 @@ stage_setup() {
   fi
 
   command -v uv >/dev/null || pip install -q uv
-  [[ -f "$VENV/bin/activate" ]] || uv venv -q --python 3.10 "$VENV"
+  # Kaggle's image sets UV_* variables (e.g. UV_SYSTEM_PYTHON) that make uv install into the system Python;
+  # always target the venv explicitly.
+  unset UV_SYSTEM_PYTHON UV_PYTHON UV_PROJECT_ENVIRONMENT
+  env | grep '^UV_' || true
+  [[ -x "$VENV/bin/python" ]] || uv venv -q --python 3.10 "$VENV"
   # shellcheck disable=SC1091
   source "$VENV/bin/activate"
-  log "installing pinned packages (torch 2.7.1 cu126, vLLM 0.10.0, TRL 0.21.0, ...)"
-  uv pip install -q torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu126
-  uv pip install -q vllm==0.10.0 trl==0.21.0
-  uv pip install -q setuptools wheel ninja
-  uv pip install -q --no-build-isolation "deepspeed>=0.16,<0.18"
+  local vpip=(uv pip install -q --python "$VENV/bin/python")
+  log "installing pinned packages into $VENV (torch 2.7.1 cu126, vLLM 0.10.0, TRL 0.21.0, ...)"
+  "${vpip[@]}" torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu126
+  "${vpip[@]}" vllm==0.10.0 trl==0.21.0
+  "${vpip[@]}" setuptools wheel ninja
+  "${vpip[@]}" --no-build-isolation "deepspeed>=0.16,<0.18"
   # datasets>=4 is needed to read processed_datasets/grpo (saved with the `List` feature type)
-  uv pip install -q bitsandbytes "datasets>=4.0,<5" wandb editdistance regex seaborn matplotlib
+  "${vpip[@]}" bitsandbytes "datasets>=4.0,<5" wandb editdistance regex seaborn matplotlib
+  [[ "$(command -v python)" == "$VENV/bin/python" ]] || die "venv python not active: $(command -v python)"
+  "$VENV/bin/python" -c "import torch, trl" || die "packages missing from $VENV after install"
   (cd "$REPO" && bash INSTALL.SH)
+  "$VENV/bin/python" -c "from trl import RankGRPOTrainer" || die "INSTALL.SH did not install RankGRPOTrainer into TRL"
   python -c "import torch, trl, vllm, deepspeed; from trl import RankGRPOTrainer; print('torch', torch.__version__, '| cuda', torch.cuda.is_available(), '| trl', trl.__version__, '| vllm', vllm.__version__, '| deepspeed', deepspeed.__version__)"
   uv cache clean -q || true
   log "disk after setup:"; df -h "$WORK" /kaggle/working 2>/dev/null | tail -n +2 || true
