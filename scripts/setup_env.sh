@@ -14,7 +14,7 @@ source "$VENV/bin/activate"
 
 # Same pins as the original README; torch comes from the CUDA 12.6 index first.
 uv pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu126
-uv pip install vllm==0.10.0 trl==0.21.0
+uv pip install vllm==0.10.0 trl==0.21.0 transformers==4.55.4 accelerate==1.10.0
 # DeepSpeed builds from source and imports torch at build time, hence --no-build-isolation.
 uv pip install setuptools wheel ninja
 uv pip install --no-build-isolation "deepspeed>=0.16,<0.18"

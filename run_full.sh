@@ -356,11 +356,12 @@ stage_setup() {
   local vpip=(uv pip install -q --python "$VENV/bin/python")
   log "installing pinned packages into $VENV (torch 2.7.1 cu126, vLLM 0.10.0, TRL 0.21.0, ...)"
   "${vpip[@]}" torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu126
-  "${vpip[@]}" vllm==0.10.0 trl==0.21.0
+  # versions contemporary with TRL 0.21 (transformers 5.x breaks TRL 0.21 imports)
+  "${vpip[@]}" vllm==0.10.0 trl==0.21.0 transformers==4.55.4 accelerate==1.10.0
   "${vpip[@]}" setuptools wheel ninja
   "${vpip[@]}" --no-build-isolation "deepspeed>=0.16,<0.18"
   # datasets>=4 is needed to read processed_datasets/grpo (saved with the `List` feature type)
-  "${vpip[@]}" bitsandbytes "datasets>=4.0,<5" wandb editdistance regex seaborn matplotlib
+  "${vpip[@]}" bitsandbytes "datasets>=4.0,<5" wandb editdistance regex seaborn matplotlib transformers==4.55.4 accelerate==1.10.0
   [[ "$(command -v python)" == "$VENV/bin/python" ]] || die "venv python not active: $(command -v python)"
   "$VENV/bin/python" -c "import torch, trl" || die "packages missing from $VENV after install"
   (cd "$REPO" && bash INSTALL.SH)
