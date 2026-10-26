@@ -98,6 +98,7 @@ export WANDB_DIR="${WANDB_DIR:-$WORK}"
 export HF_HOME="${HF_HOME:-$WORK/hf}"             # base model download for the zero-shot eval
 export UV_CACHE_DIR="${UV_CACHE_DIR:-$WORK/uv-cache}"  # cleaned after setup
 export TOKENIZERS_PARALLELISM=false
+export MPLBACKEND=Agg                         # Kaggle notebooks export an inline backend that scripts cannot use
 export DS_SKIP_CUDA_CHECK=1                   # DeepSpeed JIT-builds its CPU Adam op against the system CUDA
 [[ -z "${CUDA_HOME:-}" && -d /usr/local/cuda ]] && export CUDA_HOME=/usr/local/cuda
 
