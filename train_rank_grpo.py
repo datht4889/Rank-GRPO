@@ -68,6 +68,10 @@ def parse_args():
     opt.add_argument("--kl_beta", type=float, default=1e-3, help="KL-divergence penalty coefficient.")
     opt.add_argument("--gradient_accumulation_steps", type=int, default=12, help="Gradient accumulation steps.")
     opt.add_argument("--optim", default="paged_adamw_8bit", help="Optimizer type (paged_adamw_8bit recommended).")
+    opt.add_argument("--opsd_coef", type=float, default=0.0,
+                     help="Rank-OPSD: weight of the privileged-hint self-distillation advantage (0 = plain Rank-GRPO).")
+    opt.add_argument("--opsd_scope", default="dead", choices=["dead", "all"],
+                     help="Rank-OPSD: add the distillation advantage only on dead (group, rank) cells or everywhere.")
 
     sched = parser.add_argument_group("Training schedule")
     sched.add_argument("--per_device_train_batch_size", type=int, default=8, help="Training batch size per GPU.")
@@ -191,6 +195,9 @@ def main():
         train_dataset=train_dataset,
         callbacks=[callback], 
     )
+    trainer.opsd_coef, trainer.opsd_scope = args.opsd_coef, args.opsd_scope
+    if args.opsd_coef:
+        accelerator.print(f"Rank-OPSD on: coef {args.opsd_coef}, scope {args.opsd_scope}")
 
     accelerator.print("🚀 Training …")
     trainer.train(resume_from_checkpoint=args.resume)

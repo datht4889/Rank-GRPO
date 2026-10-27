@@ -67,6 +67,8 @@ TRAIN_OPTIM="${TRAIN_OPTIM:-paged_adamw_8bit}"  # HF optimizer; with DS_OFFLOAD_
 EVAL_MEM="${EVAL_MEM:-0.85}"                  # vLLM GPU memory fraction for evaluation
 
 REWARD="${REWARD:-exp_inf}"                   # exp_inf = Rank-GRPO (exp), log_decay = Rank-GRPO (log)
+OPSD_COEF="${OPSD_COEF:-0}"                   # Rank-OPSD: weight of the privileged-hint self-distillation advantage (0 = off)
+OPSD_SCOPE="${OPSD_SCOPE:-dead}"              # dead = only (group, rank) cells where all 8 lists miss | all
 RL_TRAIN_SET="${RL_TRAIN_SET:-rows}"          # rows = Rank-GRPO (one row per responder) | union = ReMaRk (one row per request, union of all responders' items)
 RL_INIT="${RL_INIT:-}"                        # SFT checkpoint to start RL from (default: own SFT if any, else released)
 RL_HOURS="${RL_HOURS:-4}"                     # wall-clock budget of the rl stage (0 = no limit)
@@ -96,7 +98,8 @@ VENV="$WORK/venv"
 SFT_RELEASED="results/Qwen/Qwen2.5-0.5B-Instruct/checkpoint-1500"
 RL_RELEASED="results/grpo/Qwen/Qwen2.5-0.5B-Instruct_lr1e-06_kl0.001/checkpoint-15800"
 SFT_OWN_DIR="results/own/sft"
-RL_OWN_DIR="results/own/rank_grpo_${REWARD}_${RL_TRAIN_SET}"
+RL_TAG="${RL_TRAIN_SET}"; [[ "$OPSD_COEF" == 0 ]] || RL_TAG="${RL_TRAIN_SET}_opsd${OPSD_COEF}_${OPSD_SCOPE}"
+RL_OWN_DIR="results/own/rank_grpo_${REWARD}_${RL_TAG}"
 
 export WANDB_MODE="${WANDB_MODE:-offline}"
 export WANDB_DIR="${WANDB_DIR:-$WORK}"
@@ -443,7 +446,7 @@ stage_rl() {
   elif [[ "$RL_TRAIN_SET" != rows ]]; then
     die "RL_TRAIN_SET must be rows or union"
   fi
-  log "Rank-GRPO ($REWARD, train set: $RL_TRAIN_SET) from $init: $NGPU GPU x $RL_PER_DEVICE x grad-accum $ga = $RL_BATCH completions/step, budget ${RL_HOURS} h"
+  log "Rank-GRPO ($REWARD, train set: $RL_TRAIN_SET, opsd coef $OPSD_COEF scope $OPSD_SCOPE) from $init: $NGPU GPU x $RL_PER_DEVICE x grad-accum $ga = $RL_BATCH completions/step, budget ${RL_HOURS} h"
   run_logged "logs/train_rank_grpo_${REWARD}.txt" "$RL_HOURS" \
     accelerate launch --config_file "$WORK/accel_rl.yaml" train_rank_grpo.py \
       --train_path "$train_path" --model_name "$MODEL" --sft_model_path "$init" \
@@ -456,10 +459,10 @@ stage_rl() {
       --use_vllm --vllm_mode colocate --vllm_gpu_memory_utilization "$VLLM_TRAIN_MEM" --vllm_tensor_parallel_size 1 \
       --gradient_checkpointing "${PREC_FLAG[@]}" \
       --save_strategy steps --save_steps "$RL_SAVE_STEPS" --save_total_limit 2 --save_only_model \
-      --logging_steps 1 --seed 3407 --wandb_project rank_grpo
+      --logging_steps 1 --seed 3407 --wandb_project rank_grpo --opsd_coef "$OPSD_COEF" --opsd_scope "$OPSD_SCOPE"
   local ck; ck=$(latest_ckpt "$RL_OWN_DIR")
   [[ -n "$ck" ]] || die "Rank-GRPO produced no checkpoint (budget too short for $RL_SAVE_STEPS steps?), see logs/train_rank_grpo_${REWARD}.txt"
-  save_ckpt "$ck" "rank_grpo_${REWARD}_$(basename "$ck")"
+  save_ckpt "$ck" "rank_grpo_${REWARD}_${RL_TAG}_$(basename "$ck")"
   python3 - "$ck/trainer_state.json" <<'EOF'
 import json, sys
 h = [e for e in json.load(open(sys.argv[1]))["log_history"] if "rewards/pos_1/mean" in e]
@@ -484,7 +487,7 @@ stage_eval_rl() {
   activate; detect_gpus
   local ck; ck=$(latest_ckpt "$RL_OWN_DIR")
   [[ -n "$ck" ]] || die "no own Rank-GRPO checkpoint in $RL_OWN_DIR (run the 'rl' stage)"
-  eval_models "own_rank_grpo_${REWARD}_${RL_TRAIN_SET}_$(basename "$ck")=$ck"
+  eval_models "own_rank_grpo_${REWARD}_${RL_TAG}_$(basename "$ck")=$ck"
 }
 
 main() {

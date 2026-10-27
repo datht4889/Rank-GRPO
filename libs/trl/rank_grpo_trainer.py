@@ -1155,6 +1155,42 @@ class RankGRPOTrainer(Trainer):
         entropy_mask = masked_entropies >= entropy_threshold
         return entropy_mask & mask.bool()  # ensure padding tokens are always masked out
 
+    # Rank-OPSD settings (set by train_rank_grpo.py; coef 0 = plain Rank-GRPO)
+    opsd_coef = 0.0
+    opsd_scope = "dead"  # "dead": only (group, rank) cells where all G lists got 0 reward; "all": every cell
+    OPSD_HINT = ("\n\nPrivileged hint: after this conversation, the user said they liked the following movies:\n{items}\n"
+                 "Use this to recommend 20 movies the user would like.")
+
+    @torch.no_grad()
+    def _opsd_item_scores(self, inputs, prompt_ids, prompt_mask, completion_ids, completion_mask,
+                          item_seg_ids, item_content_mask, rec_num, batch_size):
+        """Per item: mean over its tokens of log p(token | prompt + ground-truth hint) - log p(token | prompt), both
+        under the current policy (self-distillation teacher = the policy that sees the privileged hint).
+        Returns (N_local, rec_num), NaN where the list has no item at that rank."""
+        device = completion_ids.device
+        hinted = []
+        for x in inputs:
+            msgs = copy.deepcopy(x["prompt"])
+            items = "\n".join(f"{t} ({y})" for t, y in x["groundtruth_with_release_year"])
+            msgs[-1]["content"] = msgs[-1]["content"] + self.OPSD_HINT.format(items=items)
+            hinted.append(maybe_apply_chat_template({"prompt": msgs}, self.processing_class)["prompt"])
+        enc = self.processing_class(text=hinted, return_tensors="pt", padding=True, padding_side="left",
+                                    add_special_tokens=False)
+        h_ids, h_mask = enc["input_ids"].to(device), enc["attention_mask"].to(device)
+        if self.max_prompt_length is not None:  # the hint is at the end of the prompt, so left truncation keeps it
+            h_ids, h_mask = h_ids[:, -(self.max_prompt_length + 256):], h_mask[:, -(self.max_prompt_length + 256):]
+        T = completion_ids.size(1)
+        lp_t, _ = self._get_per_token_logps_and_entropies(
+            self.model, torch.cat([h_ids, completion_ids], 1), torch.cat([h_mask, completion_mask], 1), T, batch_size)
+        lp_s, _ = self._get_per_token_logps_and_entropies(
+            self.model, torch.cat([prompt_ids, completion_ids], 1), torch.cat([prompt_mask, completion_mask], 1), T,
+            batch_size)
+        m = item_content_mask.float()
+        seg = item_seg_ids.clamp(min=0, max=rec_num - 1)
+        sums = torch.zeros(seg.size(0), rec_num, device=device).scatter_add_(1, seg, (lp_t - lp_s).float() * m)
+        cnts = torch.zeros(seg.size(0), rec_num, device=device).scatter_add_(1, seg, m)
+        return torch.where(cnts > 0, sums / cnts.clamp(min=1), torch.full_like(sums, float("nan")))
+
     @profiling_decorator
     def _get_per_token_logps_and_entropies(
         self,
@@ -1805,17 +1841,36 @@ class RankGRPOTrainer(Trainer):
         if self.scale_rewards:
             advantages_items = advantages_items / (std_rep + 1e-4)             # (N_total, rec_num)
 
+        # Build segmentation (unbounded IDs), then broadcast per-item advantages only to the first rec_num items
+        item_seg_ids, item_content_mask, overflow_token_mask = self._segment_items_from_tokens(
+            completion_ids, completion_mask, max_items=rec_num
+        )  # (N_local,T) each
+
+        # === Rank-OPSD (optional): privileged-hint self-distillation where Rank-GRPO has no signal ===
+        if self.opsd_coef != 0.0 and mode == "train":
+            d_local = self._opsd_item_scores(inputs, prompt_ids, prompt_mask, completion_ids, completion_mask,
+                                             item_seg_ids, item_content_mask, rec_num, batch_size)
+            d = gather(d_local).view(Bglob, G, rec_num)                        # NaN = item missing in that list
+            valid = ~torch.isnan(d)
+            cnt = valid.sum(dim=1, keepdim=True).clamp(min=1)
+            mu = torch.where(valid, d, torch.zeros_like(d)).sum(dim=1, keepdim=True) / cnt
+            dev = torch.where(valid, d - mu, torch.zeros_like(d))
+            sd = ((dev ** 2).sum(dim=1, keepdim=True) / (cnt - 1).clamp(min=1)).sqrt()
+            z = dev / (sd + 1e-4)                                              # standardised within group, per rank
+            dead = (group_means_items == 0) & (group_stds_items == 0)          # (Bglob, rec_num): all G lists miss
+            scope = dead if self.opsd_scope == "dead" else torch.ones_like(dead)
+            opsd_adv = self.opsd_coef * z * scope.unsqueeze(1).float()
+            advantages_items = advantages_items + opsd_adv.view(-1, rec_num)
+            self._metrics[mode]["opsd/dead_rank_frac"].append(dead.float().mean().item())
+            self._metrics[mode]["opsd/logratio_mean"].append(d[valid].mean().item() if valid.any() else 0.0)
+            self._metrics[mode]["opsd/adv_abs_mean"].append(opsd_adv.abs().mean().item())
+
         # Slice to local process
         process_slice = slice(
             self.accelerator.process_index * len(prompts),
             (self.accelerator.process_index + 1) * len(prompts),
         )
         advantages_items_local = advantages_items[process_slice]                # (N_local, rec_num)
-
-        # Build segmentation (unbounded IDs), then broadcast per-item advantages only to the first rec_num items
-        item_seg_ids, item_content_mask, overflow_token_mask = self._segment_items_from_tokens(
-            completion_ids, completion_mask, max_items=rec_num
-        )  # (N_local,T) each
 
         # How many items were emitted in each sequence? (natural indices)
         with torch.no_grad():
