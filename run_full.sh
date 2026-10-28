@@ -84,6 +84,10 @@ SFT_BATCH="${SFT_BATCH:-192}"                 # sequences per optimizer step (pa
 SFT_PER_DEVICE="${SFT_PER_DEVICE:-4}"
 SFT_SAVE_STEPS="${SFT_SAVE_STEPS:-100}"
 
+HINTSFT_HOURS="${HINTSFT_HOURS:-4}"            # hint-SFT (scripts/build_hint_sft.py data) from the released SFT ckpt-1500
+HINTSFT_LR="${HINTSFT_LR:-1e-5}"
+HINTSFT_EPOCHS="${HINTSFT_EPOCHS:-1}"
+
 COPY_CKPT="${COPY_CKPT:-1}"                   # copy final own checkpoints (weights only, ~1 GB each) to $OUT
 
 DEFAULT_STAGES="setup data eval rl eval_rl"
@@ -98,6 +102,7 @@ VENV="$WORK/venv"
 SFT_RELEASED="results/Qwen/Qwen2.5-0.5B-Instruct/checkpoint-1500"
 RL_RELEASED="results/grpo/Qwen/Qwen2.5-0.5B-Instruct_lr1e-06_kl0.001/checkpoint-15800"
 SFT_OWN_DIR="results/own/sft"
+HINTSFT_DIR="results/own/hint_sft"
 RL_TAG="${RL_TRAIN_SET}"; [[ "$OPSD_COEF" == 0 ]] || RL_TAG="${RL_TRAIN_SET}_opsd${OPSD_COEF}_${OPSD_SCOPE}"
 RL_OWN_DIR="results/own/rank_grpo_${REWARD}_${RL_TAG}"
 
@@ -483,6 +488,41 @@ stage_noise() {  # responder-noise diagnostic (ReMaRk claim) on the SFT policy: 
   cp logs/responder_noise.txt "$OUT/" 2>/dev/null || true
 }
 
+stage_hintsft() {  # teach the SFT policy to use privileged hints; half of the data replays the original SFT rows
+  activate; detect_gpus
+  python scripts/build_hint_sft.py 2>&1 | tee logs/build_hint_sft.txt
+  local ga; ga=$(grad_accum "$SFT_BATCH" "$SFT_PER_DEVICE")
+  write_accel_cfg "$WORK/accel_hintsft.yaml" "$ga"
+  log "hint-SFT from $SFT_RELEASED: lr $HINTSFT_LR, $HINTSFT_EPOCHS epoch(s), $SFT_BATCH seqs/step, budget ${HINTSFT_HOURS} h"
+  run_logged logs/train_hintsft.txt "$HINTSFT_HOURS"     accelerate launch --config_file "$WORK/accel_hintsft.yaml" train_sft.py       --dataset_path processed_datasets/sft_hint_dataset --model_name "$SFT_RELEASED" --output_dir "$HINTSFT_DIR"       --learning_rate "$HINTSFT_LR" --warmup_ratio 0.05 --lr_scheduler_type cosine --optim "$TRAIN_OPTIM"       --num_train_epochs "$HINTSFT_EPOCHS" --max_length 1280       --per_device_train_batch_size "$SFT_PER_DEVICE" --per_device_eval_batch_size "$SFT_PER_DEVICE"       --gradient_accumulation_steps "$ga" --gradient_checkpointing "${PREC_FLAG[@]}"       --save_strategy steps --save_steps 50 --save_total_limit 1 --save_only_model       --eval_strategy steps --eval_steps 50 --logging_steps 10 --dataset_num_proc 4 --seed 3407
+  local ck; ck=$(latest_ckpt "$HINTSFT_DIR")
+  [[ -n "$ck" ]] || die "hint-SFT produced no checkpoint, see logs/train_hintsft.txt"
+  save_ckpt "$ck" "hintsft_$(basename "$ck")"
+}
+
+stage_eval_hintsft() {  # no-hint test eval: the hint-SFT policy must not lose recall vs ckpt-1500
+  activate; detect_gpus
+  local ck; ck=$(latest_ckpt "$HINTSFT_DIR")
+  [[ -n "$ck" ]] || die "no hint-SFT checkpoint in $HINTSFT_DIR (run the 'hintsft' stage)"
+  eval_models "own_hintsft_$(basename "$ck")=$ck"
+}
+
+stage_probe_hint() {  # rollout probe: AUC of A = lp(teacher + hint) - lp(student) on the ckpt-1500 student's rollouts
+  activate; detect_gpus
+  local P="$OUT/probe_hint" ck; ck=$(latest_ckpt "$HINTSFT_DIR")
+  mkdir -p "$P"
+  export RANKGRPO_REPO="$REPO"
+  python scripts/rollout_probe.py rollout --student "$SFT_RELEASED" --n_requests 300 --G 8 --gen_bs 8     --max_new_tokens 512 --out "$P" > "$P/run_rollout.log" 2>&1 || die "rollout failed, see $P/run_rollout.log"
+  local spec
+  for spec in "student|$SFT_RELEASED|" "student_hint_v1|$SFT_RELEASED|--hint --hint_style v1"               "student_hint_v2|$SFT_RELEASED|--hint --hint_style v2"               ${ck:+"hintsft|$ck|" "hintsft_hint_v2|$ck|--hint --hint_style v2"}; do
+    IFS='|' read -r name model flags <<< "$spec"
+    log "probe score $name"
+    # shellcheck disable=SC2086
+    python scripts/rollout_probe.py score --name "$name" --model "$model" $flags --dtype fp16 --score_bs 16       --out "$P" > "$P/run_$name.log" 2>&1 || { echo "score $name FAILED:"; tail -20 "$P/run_$name.log"; }
+  done
+  python scripts/rollout_probe.py report --boot 300 --out "$P" 2>&1 | tee "$P/run_report.log"
+}
+
 stage_eval_rl() {
   activate; detect_gpus
   local ck; ck=$(latest_ckpt "$RL_OWN_DIR")
@@ -495,7 +535,7 @@ main() {
   (( ${#stages[@]} )) || read -r -a stages <<< "$DEFAULT_STAGES"
   local s
   for s in "${stages[@]}"; do
-    case "$s" in setup|data|eval|noise|sft|eval_sft|rl|eval_rl) ;; *) die "unknown stage '$s'" ;; esac
+    case "$s" in setup|data|eval|noise|sft|eval_sft|rl|eval_rl|hintsft|eval_hintsft|probe_hint) ;; *) die "unknown stage '$s'" ;; esac
   done
   log "stages: ${stages[*]} | WORK=$WORK | OUT=$OUT"
   for s in "${stages[@]}"; do
