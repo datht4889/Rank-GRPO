@@ -73,6 +73,12 @@ def parse_args():
     opt.add_argument("--opsd_scope", default="dead", choices=["dead", "all"],
                      help="Rank-OPSD: add the distillation advantage only on dead (group, rank) cells or everywhere.")
 
+    opt.add_argument("--cf_coef", type=float, default=0.0,
+                     help="CF partial credit: weight of the centred EASE item score added to the advantage (0 = off).")
+    opt.add_argument("--cf_scope", default="all", choices=["all", "hit"],
+                     help="CF partial credit on every (group, rank) cell or only on cells with at least one hit.")
+    opt.add_argument("--cf_path", default="cf/ease_l1000.npz", help="EASE matrix from scripts/build_cf_ease.py.")
+
     sched = parser.add_argument_group("Training schedule")
     sched.add_argument("--per_device_train_batch_size", type=int, default=8, help="Training batch size per GPU.")
     sched.add_argument("--per_device_eval_batch_size", type=int, default=8, help="Evaluation batch size per GPU.")
@@ -196,6 +202,11 @@ def main():
         callbacks=[callback], 
     )
     trainer.opsd_coef, trainer.opsd_scope = args.opsd_coef, args.opsd_scope
+    if args.cf_coef:
+        from libs.cf_reward import CFScorer
+        trainer.cf_coef, trainer.cf_scope = args.cf_coef, args.cf_scope
+        trainer.cf_scorer = CFScorer(args.cf_path, gt_catalog)
+        accelerator.print(f"CF partial credit on: coef {args.cf_coef}, scope {args.cf_scope}, {args.cf_path}")
     if args.opsd_coef:
         accelerator.print(f"Rank-OPSD on: coef {args.opsd_coef}, scope {args.opsd_scope}")
 

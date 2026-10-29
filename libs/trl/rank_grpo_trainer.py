@@ -1155,6 +1155,11 @@ class RankGRPOTrainer(Trainer):
         entropy_mask = masked_entropies >= entropy_threshold
         return entropy_mask & mask.bool()  # ensure padding tokens are always masked out
 
+    # CF partial credit (set by train_rank_grpo.py; coef 0 = off): libs/cf_reward.CFScorer
+    cf_coef = 0.0
+    cf_scope = "all"  # "all": every (group, rank) cell; "hit": only cells where at least one of the G lists hits
+    cf_scorer = None
+
     # Rank-OPSD settings (set by train_rank_grpo.py; coef 0 = plain Rank-GRPO)
     opsd_coef = 0.0
     opsd_scope = "dead"  # "dead": only (group, rank) cells where all G lists got 0 reward; "all": every cell
@@ -1864,6 +1869,23 @@ class RankGRPOTrainer(Trainer):
             self._metrics[mode]["opsd/dead_rank_frac"].append(dead.float().mean().item())
             self._metrics[mode]["opsd/logratio_mean"].append(d[valid].mean().item() if valid.any() else 0.0)
             self._metrics[mode]["opsd/adv_abs_mean"].append(opsd_adv.abs().mean().item())
+
+        # === CF partial credit (optional): item-item EASE score of non-hit items, centred within the group per rank ===
+        # Added after the std normalisation and not divided by the group std, so it stays a small shaping term even
+        # in all-miss cells (std normalisation would rescale it to full advantage size there).
+        if self.cf_coef != 0.0 and mode == "train":
+            texts = [c[0]["content"] if isinstance(c, list) else c for c in completions]
+            s_local = self.cf_scorer.scores(texts, [x["groundtruth_with_release_year"] for x in inputs],
+                                            [x["seen_titles"] for x in inputs], rec_num)
+            s_cf = gather(torch.tensor(s_local, device=device)).view(Bglob, G, rec_num)
+            has_hit = group_means_items > 0                                    # (Bglob, rec_num)
+            scope = has_hit if self.cf_scope == "hit" else torch.ones_like(has_hit)
+            cf_adv = self.cf_coef * (s_cf - s_cf.mean(dim=1, keepdim=True)) * scope.unsqueeze(1).float()
+            advantages_items = advantages_items + cf_adv.view(-1, rec_num)
+            miss = rewards_items.view(Bglob, G, rec_num) == 0
+            self._metrics[mode]["cf/score_miss_mean"].append(s_cf[miss].mean().item() if miss.any() else 0.0)
+            self._metrics[mode]["cf/adv_abs_mean"].append(cf_adv.abs().mean().item())
+            self._metrics[mode]["cf/scope_frac"].append(scope.float().mean().item())
 
         # Slice to local process
         process_slice = slice(
