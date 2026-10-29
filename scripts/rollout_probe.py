@@ -126,7 +126,7 @@ def load_model(name, dtype):
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     dt = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[dtype]
-    model = AutoModelForCausalLM.from_pretrained(name, dtype=dt, device_map="auto" if DEV == "cuda" else "cpu").eval()
+    model = AutoModelForCausalLM.from_pretrained(name, torch_dtype=dt, device_map="auto" if DEV == "cuda" else "cpu").eval()
     return tok, model
 
 
