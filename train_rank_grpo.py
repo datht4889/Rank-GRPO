@@ -78,6 +78,11 @@ def parse_args():
     opt.add_argument("--cf_scope", default="all", choices=["all", "hit"],
                      help="CF partial credit on every (group, rank) cell or only on cells with at least one hit.")
     opt.add_argument("--cf_path", default="cf/ease_l1000.npz", help="EASE matrix from scripts/build_cf_ease.py.")
+    opt.add_argument("--luffy_gold", type=int, default=0,
+                     help="LUFFY gold guidance: max gold items written into one list per group (0 = off; exp_inf only).")
+    opt.add_argument("--luffy_scope", default="dead", choices=["dead", "all"],
+                     help="LUFFY: guide only groups where no list hits at any rank, or every group with a dead rank.")
+    opt.add_argument("--luffy_gamma", type=float, default=0.1, help="LUFFY policy shaping f(p) = p / (p + gamma).")
 
     sched = parser.add_argument_group("Training schedule")
     sched.add_argument("--per_device_train_batch_size", type=int, default=8, help="Training batch size per GPU.")
@@ -207,6 +212,12 @@ def main():
         trainer.cf_coef, trainer.cf_scope = args.cf_coef, args.cf_scope
         trainer.cf_scorer = CFScorer(args.cf_path, gt_catalog)
         accelerator.print(f"CF partial credit on: coef {args.cf_coef}, scope {args.cf_scope}, {args.cf_path}")
+    if args.luffy_gold:
+        if args.reward_func != "exp_inf":
+            raise ValueError("LUFFY gold guidance reads 0/1 hits per rank, so it needs --reward_func exp_inf")
+        trainer.luffy_gold, trainer.luffy_scope, trainer.luffy_gamma = args.luffy_gold, args.luffy_scope, args.luffy_gamma
+        accelerator.print(f"LUFFY gold guidance on: {args.luffy_gold} gold/list, scope {args.luffy_scope}, "
+                          f"gamma {args.luffy_gamma}")
     if args.opsd_coef:
         accelerator.print(f"Rank-OPSD on: coef {args.opsd_coef}, scope {args.opsd_scope}")
 

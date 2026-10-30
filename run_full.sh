@@ -72,6 +72,9 @@ OPSD_SCOPE="${OPSD_SCOPE:-dead}"              # dead = only (group, rank) cells 
 CF_COEF="${CF_COEF:-0}"                       # CF partial credit: weight of the centred EASE item score in the advantage (0 = off)
 CF_SCOPE="${CF_SCOPE:-all}"                   # all = every (group, rank) cell | hit = only cells where some list hits
 CF_LAM="${CF_LAM:-1000}"                      # EASE L2 for the CF matrix (scripts/build_cf_ease.py)
+LUFFY_GOLD="${LUFFY_GOLD:-0}"                 # LUFFY gold guidance: max gold items written into one list per group (0 = off)
+LUFFY_SCOPE="${LUFFY_SCOPE:-dead}"            # dead = only groups where all 8 lists miss every rank | all = any dead rank
+LUFFY_GAMMA="${LUFFY_GAMMA:-0.1}"             # LUFFY policy shaping f(p) = p / (p + gamma) on the gold tokens
 RL_TRAIN_SET="${RL_TRAIN_SET:-rows}"          # rows = Rank-GRPO (one row per responder) | union = ReMaRk (one row per request, union of all responders' items)
 RL_INIT="${RL_INIT:-}"                        # SFT checkpoint to start RL from (default: own SFT if any, else released)
 RL_HOURS="${RL_HOURS:-4}"                     # wall-clock budget of the rl stage (0 = no limit)
@@ -108,6 +111,7 @@ SFT_OWN_DIR="results/own/sft"
 HINTSFT_DIR="results/own/hint_sft"
 RL_TAG="${RL_TRAIN_SET}"; [[ "$OPSD_COEF" == 0 ]] || RL_TAG="${RL_TRAIN_SET}_opsd${OPSD_COEF}_${OPSD_SCOPE}"
 [[ "$CF_COEF" == 0 ]] || RL_TAG="${RL_TAG}_cf${CF_COEF}_${CF_SCOPE}_l${CF_LAM}"
+[[ "$LUFFY_GOLD" == 0 ]] || RL_TAG="${RL_TAG}_luffy${LUFFY_GOLD}_${LUFFY_SCOPE}_g${LUFFY_GAMMA}"
 RL_OWN_DIR="results/own/rank_grpo_${REWARD}_${RL_TAG}"
 
 export WANDB_MODE="${WANDB_MODE:-offline}"
@@ -459,7 +463,7 @@ stage_rl() {
   if [[ "$CF_COEF" != 0 && ! -f "$cf_path" ]]; then
     python scripts/build_cf_ease.py --lam "$CF_LAM" --out "$cf_path" || die "CF matrix build failed"
   fi
-  log "Rank-GRPO ($REWARD, train set: $RL_TRAIN_SET, opsd coef $OPSD_COEF scope $OPSD_SCOPE, cf coef $CF_COEF scope $CF_SCOPE lam $CF_LAM) from $init: $NGPU GPU x $RL_PER_DEVICE x grad-accum $ga = $RL_BATCH completions/step, budget ${RL_HOURS} h"
+  log "Rank-GRPO ($REWARD, train set: $RL_TRAIN_SET, opsd coef $OPSD_COEF scope $OPSD_SCOPE, cf coef $CF_COEF scope $CF_SCOPE lam $CF_LAM, luffy gold $LUFFY_GOLD scope $LUFFY_SCOPE gamma $LUFFY_GAMMA) from $init: $NGPU GPU x $RL_PER_DEVICE x grad-accum $ga = $RL_BATCH completions/step, budget ${RL_HOURS} h"
   run_logged "logs/train_rank_grpo_${REWARD}.txt" "$RL_HOURS" \
     accelerate launch --config_file "$WORK/accel_rl.yaml" train_rank_grpo.py \
       --train_path "$train_path" --model_name "$MODEL" --sft_model_path "$init" \
@@ -472,7 +476,7 @@ stage_rl() {
       --use_vllm --vllm_mode colocate --vllm_gpu_memory_utilization "$VLLM_TRAIN_MEM" --vllm_tensor_parallel_size 1 \
       --gradient_checkpointing "${PREC_FLAG[@]}" \
       --save_strategy steps --save_steps "$RL_SAVE_STEPS" --save_total_limit 2 --save_only_model \
-      --logging_steps 1 --seed 3407 --wandb_project rank_grpo --opsd_coef "$OPSD_COEF" --opsd_scope "$OPSD_SCOPE"       --cf_coef "$CF_COEF" --cf_scope "$CF_SCOPE" --cf_path "$cf_path"
+      --logging_steps 1 --seed 3407 --wandb_project rank_grpo --opsd_coef "$OPSD_COEF" --opsd_scope "$OPSD_SCOPE"       --cf_coef "$CF_COEF" --cf_scope "$CF_SCOPE" --cf_path "$cf_path"       --luffy_gold "$LUFFY_GOLD" --luffy_scope "$LUFFY_SCOPE" --luffy_gamma "$LUFFY_GAMMA"
   local ck; ck=$(latest_ckpt "$RL_OWN_DIR")
   [[ -n "$ck" ]] || die "Rank-GRPO produced no checkpoint (budget too short for $RL_SAVE_STEPS steps?), see logs/train_rank_grpo_${REWARD}.txt"
   save_ckpt "$ck" "rank_grpo_${REWARD}_${RL_TAG}_$(basename "$ck")"

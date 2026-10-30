@@ -1160,6 +1160,93 @@ class RankGRPOTrainer(Trainer):
     cf_scope = "all"  # "all": every (group, rank) cell; "hit": only cells where at least one of the G lists hits
     cf_scorer = None
 
+    # LUFFY-style gold guidance (arXiv 2504.14945; set by train_rank_grpo.py; luffy_gold 0 = off). The teacher trace is
+    # the ground truth: one list per group gets gold items written into the earliest ranks where no list of the group
+    # hits; those tokens are off-policy (pi_phi = 1, no clip, shaped by f(p) = p / (p + gamma)).
+    luffy_gold = 0        # max gold items written into the guided list
+    luffy_scope = "dead"  # "dead": only groups where no list hits at any rank; "all": every group with a dead rank
+    luffy_gamma = 0.1
+    _ITEM_RE = re.compile(r"(.+?)\s+\((\d{4})\)")
+
+    @torch.no_grad()
+    def _luffy_patch(self, inputs, completion_ids, rec_num):
+        """Writes gold items into the last list of each eligible group (unchanged items keep their sampled tokens).
+        Returns the re-padded completion ids and a bool mask of the written (off-policy) tokens."""
+        G, device = self.num_generations, completion_ids.device
+        n = completion_ids.size(0)
+        if n % G:
+            raise ValueError(f"LUFFY needs whole groups on each process ({n} completions, G={G})")
+        tok = getattr(self.processing_class, "tokenizer", self.processing_class)
+        rows = completion_ids.tolist()
+        texts = tok.batch_decode(completion_ids, skip_special_tokens=True)
+        hits = self.reward_funcs[0](completions=[[{"role": "assistant", "content": t}] for t in texts],
+                                    groundtruth_with_release_year=[x["groundtruth_with_release_year"] for x in inputs],
+                                    seen_titles=[x["seen_titles"] for x in inputs])
+        dead = torch.tensor(hits).view(n // G, G, rec_num).sum(dim=1) == 0      # (groups, rec_num)
+        offp = [[] for _ in range(n)]
+        n_groups = n_patched = n_gold = 0
+        for g in range(n // G):
+            n_groups += 1
+            i = g * G + G - 1
+            if inputs[i]["prompt"] != inputs[g * G]["prompt"] or not dead[g].any():
+                continue
+            if self.luffy_scope == "dead" and not dead[g].all():
+                continue
+            row = rows[i]
+            if self.eos_token_id not in row:  # truncated list: leave it on-policy
+                continue
+            body = row[:row.index(self.eos_token_id)]
+            seg, _, _ = self._segment_items_from_tokens(
+                torch.tensor([body], device=device), torch.ones(1, len(body), dtype=torch.long, device=device), rec_num)
+            seg = seg[0].tolist()
+            spans = []  # token spans per item index, in order
+            for t, s in zip(body, seg):
+                if not spans or spans[-1][0] != s:
+                    spans.append((s, []))
+                spans[-1][1].append(t)
+            items = [tok.decode(sp, skip_special_tokens=True) for _, sp in spans]
+            parsed = [self._ITEM_RE.match(it.strip()) for it in items[:rec_num]]
+            if [s for s, _ in spans[:rec_num]] != list(range(len(parsed))) or not all(parsed):
+                continue  # rank index != item index (blank or unparsable lines): skip rather than mislabel
+            listed = {(m.group(1).strip().lower(), m.group(2)) for m in parsed}
+            seen = {str(t).strip().lower() for t in inputs[i]["seen_titles"]}
+            # In a partly live group a gold item may already be hit by some list; writing it again would move a hit
+            group_text = "\n".join(texts[g * G:(g + 1) * G]).lower() if self.luffy_scope == "all" else ""
+            gold = [(str(t), str(y)) for t, y in inputs[i]["groundtruth_with_release_year"]
+                    if (str(t).strip().lower(), str(y)) not in listed and str(t).strip().lower() not in seen
+                    and str(t).strip().lower() not in group_text]
+            gold = list(dict.fromkeys((t.strip(), y) for t, y in gold))  # the union ground truth can repeat items
+            ranks = [k for k in range(len(parsed)) if dead[g, k]]
+            new_spans = {k: (t, y) for (t, y), k in zip(gold[:self.luffy_gold], ranks)}
+            if not new_spans:
+                continue
+            new_row, mask = [], []
+            for k, (_, sp) in enumerate(spans):
+                if k in new_spans:
+                    t, y = new_spans[k]
+                    nl = items[k][len(items[k].rstrip("\n")):]
+                    sp = tok.encode(f"{t} ({y}){nl}", add_special_tokens=False)
+                new_row += sp
+                mask += [k in new_spans] * len(sp)
+            new_row.append(self.eos_token_id)
+            mask.append(False)
+            if len(new_row) > self.max_completion_length:
+                continue
+            rows[i], offp[i] = new_row, mask
+            n_patched += 1
+            n_gold += len(new_spans)
+        width = max(len(r) for r in rows)
+        ids = torch.full((n, width), self.pad_token_id, dtype=completion_ids.dtype, device=device)
+        offp_mask = torch.zeros((n, width), dtype=torch.bool, device=device)
+        for i, r in enumerate(rows):
+            ids[i, :len(r)] = torch.tensor(r, dtype=completion_ids.dtype)
+            if offp[i]:
+                offp_mask[i, :len(offp[i])] = torch.tensor(offp[i])
+        self._metrics["train"]["luffy/patched_group_frac"].append(n_patched / max(n_groups, 1))
+        self._metrics["train"]["luffy/gold_per_patched_list"].append(n_gold / max(n_patched, 1))
+        self._metrics["train"]["luffy/dead_rank_frac"].append(dead.float().mean().item())
+        return ids, offp_mask
+
     # Rank-OPSD settings (set by train_rank_grpo.py; coef 0 = plain Rank-GRPO)
     opsd_coef = 0.0
     opsd_scope = "dead"  # "dead": only (group, rank) cells where all G lists got 0 reward; "all": every cell
@@ -1725,6 +1812,12 @@ class RankGRPOTrainer(Trainer):
             prompt_ids = prompt_completion_ids[:, :prompt_length]
             completion_ids = prompt_completion_ids[:, prompt_length:]
 
+        # === LUFFY gold guidance (optional): write gold items into one list per group before anything is scored ===
+        offp_mask = None
+        if self.luffy_gold > 0 and mode == "train":
+            completion_ids, offp_mask = self._luffy_patch(inputs, completion_ids, getattr(self, "rec_num", None) or 20)
+            prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+
         # Mask everything after the first EOS token
         is_eos = completion_ids == self.eos_token_id
         eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
@@ -1963,6 +2056,9 @@ class RankGRPOTrainer(Trainer):
         self._metrics[mode]["reward"].append(group_means_items.mean().item())
         self._metrics[mode]["reward_std"].append(group_stds_items.mean().item())
         self._metrics[mode]["frac_reward_zero_std"].append(is_std_zero.float().mean().item())
+        if offp_mask is not None:  # "reward" above includes the written gold hits; this one is comparable to plain runs
+            guided = gather(offp_mask.any(dim=1).int()).bool()
+            self._metrics[mode]["luffy/reward_unguided"].append(rewards_items[~guided].mean().item())
 
         # Log prompt/completion texts and a seq-level sum for visibility
         self._logs["prompt"].extend(gather_object(prompts_text))
@@ -1984,6 +2080,8 @@ class RankGRPOTrainer(Trainer):
             "item_token_mask": item_token_mask,
             "item_seg_ids": item_seg_ids,
         }
+        if offp_mask is not None:
+            output["offp_mask"] = offp_mask & item_content_mask
         if old_per_token_logps is not None:
             output["old_per_token_logps"] = old_per_token_logps
         if ref_per_token_logps is not None:
@@ -2152,6 +2250,16 @@ class RankGRPOTrainer(Trainer):
         per_token_loss1 = coef_1 * adv
         per_token_loss2 = coef_2 * adv
         per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
+        offp = inputs.get("offp_mask")
+        if offp is not None:  # every process takes this branch (train with LUFFY on), so the gathers below are safe
+            # LUFFY on the gold tokens: pi_phi = 1 so the ratio is p itself, no clip, regularised by f(p) = p / (p + gamma)
+            p = per_token_logps.exp()
+            per_token_loss = torch.where(offp, -(p / (p + self.luffy_gamma)) * adv, per_token_loss)
+            m = self._metrics["train" if self.model.training else "eval"]
+            p_mean = p[offp].mean().detach() if offp.any() else torch.tensor(float("nan"), device=p.device)
+            m["luffy/offp_token_p_mean"].append(self.accelerator.gather(p_mean).nanmean().item())
+            m["luffy/offp_token_frac"].append(self.accelerator.gather(
+                (offp.sum() / mask_for_loss.sum().clamp(min=1)).float()).mean().item())
         if entropy_mask is not None:
             per_token_loss = per_token_loss * entropy_mask
         if self.beta != 0.0:
